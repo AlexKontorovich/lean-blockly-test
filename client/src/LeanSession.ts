@@ -36,6 +36,10 @@ class LeanSessionHolder {
       this.manager = manager;
       this.connecting = false;
       log(TAG, 'Session ready');
+      // Expose a debug helper on `window` so the user can dump the
+      // virtual filesystem state from devtools: `dumpLeanFiles()`.
+      (window as unknown as { dumpLeanFiles: () => void }).dumpLeanFiles =
+        () => manager.dumpFiles();
       for (const cb of this.readyCallbacks) cb(manager);
       this.readyCallbacks = [];
     }).catch((err) => {

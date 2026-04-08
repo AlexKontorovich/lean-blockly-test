@@ -318,6 +318,30 @@ export class LeanSessionManager {
     }, KEEPALIVE_PERIOD_MS);
   }
 
+  // ── Debug ───────────────────────────────────────────────────────
+
+  /**
+   * Print the current state of the virtual filesystem to the console:
+   * for each URI we've ever sent to Lean, the latest content along with
+   * its version and document-open status. Intended to be called from
+   * the browser devtools console.
+   */
+  dumpFiles(): void {
+    if (this.uriStates.size === 0) {
+      console.log('[LeanSessionManager] no files');
+      return;
+    }
+    for (const [uri, state] of this.uriStates) {
+      console.groupCollapsed(
+        `[LeanSessionManager] ${uri}  (v${state.documentVersion}, ${
+          state.documentOpen ? 'open' : 'closed'
+        }, ${state.lastContent?.length ?? 0} chars)`,
+      );
+      console.log(state.lastContent ?? '<no content>');
+      console.groupEnd();
+    }
+  }
+
   // ── Utilities ───────────────────────────────────────────────────
 
   private getOrCreateState(uri: string): UriState {
