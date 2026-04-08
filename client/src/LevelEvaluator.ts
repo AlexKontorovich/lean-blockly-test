@@ -128,10 +128,13 @@ export class LevelEvaluator {
 
     try {
       await this.session.updateFile(this.uri, fullSource);
-      // Wait for BOTH processing-complete and a fresh publishDiagnostics
-      // batch. The two notifications arrive independently and in either
-      // order; reading diagnostics after only waitForProcessing would
-      // race with stale diagnostics from the previous edit.
+      // Wait for both the server to finish elaborating AND for the
+      // cached diagnostics to be at least as fresh as the version we
+      // sent. Both waits are version-based on the URI's latestSentVersion
+      // captured at call time, so concurrent evaluate() calls all wait
+      // for the same target. waitForDiagnostics has an internal timeout
+      // fallback for the "Lean skipped publishDiagnostics because the
+      // new batch matches the previous one" case.
       await Promise.all([
         this.session.waitForProcessing(this.uri),
         this.session.waitForDiagnostics(this.uri),

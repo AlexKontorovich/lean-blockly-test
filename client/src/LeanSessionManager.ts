@@ -17,6 +17,14 @@ import type { MessageConnection } from './LeanLspClient';
 import { log, logError } from './log';
 
 const KEEPALIVE_PERIOD_MS = 10_000;
+/**
+ * If `waitForDiagnostics` does not see a fresh `publishDiagnostics`
+ * within this many milliseconds after `waitForProcessing` resolves, it
+ * gives up and resolves anyway. This handles Lean's "skip publish if
+ * the diagnostic list is byte-identical to the previous batch"
+ * optimization, which would otherwise hang the wait forever.
+ */
+const DIAGNOSTICS_WAIT_TIMEOUT_MS = 250;
 const TAG = 'LeanSessionManager';
 
 // ── Public types ─────────────────────────────────────────────────────
@@ -52,20 +60,31 @@ export interface Disposable {
 
 interface UriState {
   documentOpen: boolean;
-  documentVersion: number;
+  /** Highest LSP document version this client has sent for this URI. */
+  latestSentVersion: number;
+  /**
+   * Highest version the server has finished elaborating, as inferred
+   * from `$/lean/fileProgress` notifications: each `processing: []`
+   * notification advances this to whatever `latestSentVersion` was at
+   * the time. `waitForProcessing` resolves once this is at or past the
+   * target version captured at call time.
+   */
+  latestProcessedVersion: number;
+  /**
+   * Highest version for which we have observed `publishDiagnostics`
+   * from the server. If `publishDiagnostics` includes a `version`
+   * field, that is used; otherwise we fall back to assuming the
+   * notification corresponds to `latestSentVersion`. `waitForDiagnostics`
+   * uses this to know when the cached diagnostics correspond to a
+   * recent enough edit.
+   */
+  diagnosticsVersion: number;
   lastContent: string | null;
   diagnostics: LspDiagnostic[];
-  /**
-   * True iff a `publishDiagnostics` notification has been received for
-   * this URI since the most recent `updateFile`. Reset to false inside
-   * `updateFile` and set to true inside the publishDiagnostics handler.
-   * Used to fix a race where `fileProgress: processing=[]` arrives
-   * before the corresponding `publishDiagnostics` for the same edit,
-   * causing readers to see stale diagnostics from the previous edit.
-   */
-  diagnosticsFreshSinceUpdate: boolean;
-  diagnosticsResolvers: Array<() => void>;
-  processingResolvers: Array<() => void>;
+  /** Resolvers waiting for `latestProcessedVersion >= targetVersion`. */
+  processingResolvers: Array<{ targetVersion: number; resolve: () => void }>;
+  /** Resolvers waiting for `diagnosticsVersion >= targetVersion`. */
+  diagnosticsResolvers: Array<{ targetVersion: number; resolve: () => void }>;
   progressListeners: Set<(processing: ProgressEntry[]) => void>;
   sessionId: string | null;
   keepAliveInterval: ReturnType<typeof setInterval> | null;
@@ -74,12 +93,13 @@ interface UriState {
 function newUriState(): UriState {
   return {
     documentOpen: false,
-    documentVersion: 0,
+    latestSentVersion: 0,
+    latestProcessedVersion: 0,
+    diagnosticsVersion: 0,
     lastContent: null,
     diagnostics: [],
-    diagnosticsFreshSinceUpdate: false,
-    diagnosticsResolvers: [],
     processingResolvers: [],
+    diagnosticsResolvers: [],
     progressListeners: new Set(),
     sessionId: null,
     keepAliveInterval: null,
@@ -108,7 +128,7 @@ export class LeanSessionManager {
         if (processing.length > 0) {
           log(TAG, `fileProgress[${shortUri(uri)}]: ${processing.length} range(s) still processing`);
         } else {
-          log(TAG, `fileProgress[${shortUri(uri)}]: processing complete`);
+          log(TAG, `fileProgress[${shortUri(uri)}]: processing complete (v${state.latestSentVersion})`);
         }
 
         // Notify raw listeners.
@@ -116,11 +136,20 @@ export class LeanSessionManager {
           try { cb(processing); } catch (err) { logError(TAG, 'progress listener threw:', err); }
         }
 
-        // Resolve waiters when fully done.
+        // When processing is fully done, advance latestProcessedVersion
+        // to whatever has been sent so far, and fire any waiters whose
+        // target version has now been reached.
         if (processing.length === 0) {
-          const resolvers = state.processingResolvers;
-          state.processingResolvers = [];
-          resolvers.forEach((r) => r());
+          state.latestProcessedVersion = state.latestSentVersion;
+          const stillWaiting: typeof state.processingResolvers = [];
+          for (const r of state.processingResolvers) {
+            if (state.latestProcessedVersion >= r.targetVersion) {
+              r.resolve();
+            } else {
+              stillWaiting.push(r);
+            }
+          }
+          state.processingResolvers = stillWaiting;
         }
       }),
     );
@@ -132,12 +161,30 @@ export class LeanSessionManager {
         if (!uri) return;
         const state = this.getOrCreateState(uri);
         state.diagnostics = params.diagnostics ?? [];
-        state.diagnosticsFreshSinceUpdate = true;
-        log(TAG, `diagnostics[${shortUri(uri)}]: ${state.diagnostics.length} item(s)`,
+
+        // LSP `publishDiagnostics` may include the document version. If
+        // present we trust it; otherwise we assume the diagnostics are
+        // for the latest version we have sent (best-effort fallback).
+        const incomingVersion: number = typeof params.version === 'number'
+          ? params.version
+          : state.latestSentVersion;
+        if (incomingVersion > state.diagnosticsVersion) {
+          state.diagnosticsVersion = incomingVersion;
+        }
+
+        log(TAG, `diagnostics[${shortUri(uri)}] (v${incomingVersion}): ${state.diagnostics.length} item(s)`,
           state.diagnostics.map((d) => `[sev=${d.severity}] ${d.message.slice(0, 80)}`));
-        const resolvers = state.diagnosticsResolvers;
-        state.diagnosticsResolvers = [];
-        resolvers.forEach((r) => r());
+
+        // Fire any qualifying waiters.
+        const stillWaiting: typeof state.diagnosticsResolvers = [];
+        for (const r of state.diagnosticsResolvers) {
+          if (state.diagnosticsVersion >= r.targetVersion) {
+            r.resolve();
+          } else {
+            stillWaiting.push(r);
+          }
+        }
+        state.diagnosticsResolvers = stillWaiting;
       }),
     );
   }
@@ -169,57 +216,90 @@ export class LeanSessionManager {
       return;
     }
 
-    // Mark diagnostics as stale until the server publishes new ones for
-    // this edit. See `waitForDiagnostics` for the consumer.
-    state.diagnosticsFreshSinceUpdate = false;
+    // CRITICAL: mutate state synchronously BEFORE the first await, so
+    // that concurrent calls with the same content short-circuit on the
+    // identity check above. If we left `lastContent` unchanged until
+    // after the await, multiple parallel `runEvaluation`s with the same
+    // contribution would each see the old value, each decide to send a
+    // didChange, and the server would process N redundant edits.
+    const wasOpen = state.documentOpen;
+    const version = ++state.latestSentVersion;
+    state.lastContent = content;
+    state.documentOpen = true;
 
-    if (!state.documentOpen) {
-      log(TAG, `didOpen[${shortUri(uri)}] (v${state.documentVersion + 1}, ${content.length} chars)`);
+    if (!wasOpen) {
+      log(TAG, `didOpen[${shortUri(uri)}] (v${version}, ${content.length} chars)`);
       await this.connection.sendNotification('textDocument/didOpen', {
         textDocument: {
           uri,
           languageId: 'lean4',
-          version: ++state.documentVersion,
+          version,
           text: content,
         },
       });
-      state.documentOpen = true;
     } else {
-      log(TAG, `didChange[${shortUri(uri)}] (v${state.documentVersion + 1}, ${content.length} chars)`);
+      log(TAG, `didChange[${shortUri(uri)}] (v${version}, ${content.length} chars)`);
       await this.connection.sendNotification('textDocument/didChange', {
         textDocument: {
           uri,
-          version: ++state.documentVersion,
+          version,
         },
         contentChanges: [{ text: content }],
       });
     }
-
-    state.lastContent = content;
   }
 
   // ── Processing ──────────────────────────────────────────────────
 
-  /** Resolves when `$/lean/fileProgress` next reports `processing: []` for `uri`. */
+  /**
+   * Resolves once the server has finished elaborating the document
+   * version that was current at the time of the call. If processing has
+   * already caught up (e.g. the caller hit the `updateFile` dedup
+   * short-circuit and there is no edit in flight), resolves immediately.
+   *
+   * The version-aware design fixes a regression that occurred when only
+   * the next `processing: []` notification was awaited: concurrent
+   * `evaluate()` calls would arrive after the latest processing cycle
+   * had already completed, then wait forever for a notification that
+   * was never going to come again.
+   */
   waitForProcessing(uri: string): Promise<void> {
     const state = this.getOrCreateState(uri);
+    const targetVersion = state.latestSentVersion;
+    if (state.latestProcessedVersion >= targetVersion) {
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
-      state.processingResolvers.push(resolve);
+      state.processingResolvers.push({ targetVersion, resolve });
     });
   }
 
   /**
-   * Resolves once a `publishDiagnostics` notification has been received
-   * for `uri` since the most recent `updateFile`. Resolves immediately
-   * if a fresh batch has already arrived. Use this together with (or
-   * instead of) `waitForProcessing` to avoid the race where
-   * processing-complete and the new diagnostics arrive in either order.
+   * Resolves once the cached diagnostics correspond to a document
+   * version at or past the current `latestSentVersion`. If the cache
+   * is already that fresh (e.g. publishDiagnostics arrived during
+   * elaboration), resolves immediately. Otherwise waits for the next
+   * publishDiagnostics — but with a hard timeout, because Lean skips
+   * `publishDiagnostics` entirely when the new diagnostic set is
+   * byte-identical to the previous one. In that case the cache is
+   * already correct (the server is implicitly saying "no change") and
+   * resolving on timeout is the right thing to do.
    */
   waitForDiagnostics(uri: string): Promise<void> {
     const state = this.getOrCreateState(uri);
-    if (state.diagnosticsFreshSinceUpdate) return Promise.resolve();
+    const targetVersion = state.latestSentVersion;
+    if (state.diagnosticsVersion >= targetVersion) {
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
-      state.diagnosticsResolvers.push(resolve);
+      let resolved = false;
+      const wrapped = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve();
+      };
+      state.diagnosticsResolvers.push({ targetVersion, resolve: wrapped });
+      setTimeout(wrapped, DIAGNOSTICS_WAIT_TIMEOUT_MS);
     });
   }
 
@@ -368,7 +448,7 @@ export class LeanSessionManager {
     }
     for (const [uri, state] of this.uriStates) {
       console.groupCollapsed(
-        `[LeanSessionManager] ${uri}  (v${state.documentVersion}, ${
+        `[LeanSessionManager] ${uri}  (sent v${state.latestSentVersion}, processed v${state.latestProcessedVersion}, ${
           state.documentOpen ? 'open' : 'closed'
         }, ${state.lastContent?.length ?? 0} chars)`,
       );
