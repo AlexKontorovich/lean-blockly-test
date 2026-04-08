@@ -6,25 +6,26 @@
  * Lean RPC method names. Provides three things to its callers:
  *
  *   1. Per-URI virtual file management (didOpen / didChange).
- *   2. File-progress observation (waitForProcessing + onProgress).
- *   3. A generic widget RPC call (`$/lean/rpc/call`), with the
+ *   2. A generic widget RPC call (`$/lean/rpc/call`), with the
  *      connect/keepalive/retry plumbing handled internally.
+ *   3. An optional `onProgress` subscription on `$/lean/fileProgress`
+ *      for callers that want raw per-range progress updates (e.g. for
+ *      future per-block "checked" status indicators).
+ *
+ * Notably absent: any state tracking for `publishDiagnostics`, any
+ * `waitForProcessing` / `waitForDiagnostics` machinery, or any
+ * version-correlation between push notifications. Higher layers
+ * (`LevelEvaluator`) get the data they need by calling
+ * `Lean.Widget.getInteractiveDiagnostics` via `widgetRpcCall` — that
+ * RPC is request/response and the server holds the response until the
+ * relevant snapshot is ready, so there is no race to manage.
  *
  * Multi-URI is supported even though current callers use a single URI.
- * See plans/REFACTOR.md for the rationale.
  */
 import type { MessageConnection } from './LeanLspClient';
 import { log, logError } from './log';
 
 const KEEPALIVE_PERIOD_MS = 10_000;
-/**
- * If `waitForDiagnostics` does not see a fresh `publishDiagnostics`
- * within this many milliseconds after `waitForProcessing` resolves, it
- * gives up and resolves anyway. This handles Lean's "skip publish if
- * the diagnostic list is byte-identical to the previous batch"
- * optimization, which would otherwise hang the wait forever.
- */
-const DIAGNOSTICS_WAIT_TIMEOUT_MS = 250;
 const TAG = 'LeanSessionManager';
 
 // ── Public types ─────────────────────────────────────────────────────
@@ -37,13 +38,6 @@ export interface Position {
 export interface Range {
   start: Position;
   end: Position;
-}
-
-export interface LspDiagnostic {
-  range: Range;
-  severity?: number;
-  message: string;
-  [key: string]: unknown;
 }
 
 export interface ProgressEntry {
@@ -63,28 +57,16 @@ interface UriState {
   /** Highest LSP document version this client has sent for this URI. */
   latestSentVersion: number;
   /**
-   * Highest version the server has finished elaborating, as inferred
-   * from `$/lean/fileProgress` notifications: each `processing: []`
+   * Highest version the server has finished elaborating, inferred from
+   * `$/lean/fileProgress` notifications: each `processing: []`
    * notification advances this to whatever `latestSentVersion` was at
    * the time. `waitForProcessing` resolves once this is at or past the
    * target version captured at call time.
    */
   latestProcessedVersion: number;
-  /**
-   * Highest version for which we have observed `publishDiagnostics`
-   * from the server. If `publishDiagnostics` includes a `version`
-   * field, that is used; otherwise we fall back to assuming the
-   * notification corresponds to `latestSentVersion`. `waitForDiagnostics`
-   * uses this to know when the cached diagnostics correspond to a
-   * recent enough edit.
-   */
-  diagnosticsVersion: number;
   lastContent: string | null;
-  diagnostics: LspDiagnostic[];
   /** Resolvers waiting for `latestProcessedVersion >= targetVersion`. */
   processingResolvers: Array<{ targetVersion: number; resolve: () => void }>;
-  /** Resolvers waiting for `diagnosticsVersion >= targetVersion`. */
-  diagnosticsResolvers: Array<{ targetVersion: number; resolve: () => void }>;
   progressListeners: Set<(processing: ProgressEntry[]) => void>;
   sessionId: string | null;
   keepAliveInterval: ReturnType<typeof setInterval> | null;
@@ -95,11 +77,8 @@ function newUriState(): UriState {
     documentOpen: false,
     latestSentVersion: 0,
     latestProcessedVersion: 0,
-    diagnosticsVersion: 0,
     lastContent: null,
-    diagnostics: [],
     processingResolvers: [],
-    diagnosticsResolvers: [],
     progressListeners: new Set(),
     sessionId: null,
     keepAliveInterval: null,
@@ -116,7 +95,10 @@ export class LeanSessionManager {
   constructor(connection: MessageConnection) {
     this.connection = connection;
 
-    // fileProgress notifications
+    // fileProgress notifications. Used both by `waitForProcessing` (to
+    // know when the server has finished elaborating a given version)
+    // and by `onProgress` subscribers (raw per-range stream for future
+    // per-block status work).
     this.disposables.push(
       connection.onNotification('$/lean/fileProgress', (params: any) => {
         const uri: string | undefined = params?.textDocument?.uri;
@@ -131,14 +113,10 @@ export class LeanSessionManager {
           log(TAG, `fileProgress[${shortUri(uri)}]: processing complete (v${state.latestSentVersion})`);
         }
 
-        // Notify raw listeners.
         for (const cb of state.progressListeners) {
           try { cb(processing); } catch (err) { logError(TAG, 'progress listener threw:', err); }
         }
 
-        // When processing is fully done, advance latestProcessedVersion
-        // to whatever has been sent so far, and fire any waiters whose
-        // target version has now been reached.
         if (processing.length === 0) {
           state.latestProcessedVersion = state.latestSentVersion;
           const stillWaiting: typeof state.processingResolvers = [];
@@ -154,39 +132,11 @@ export class LeanSessionManager {
       }),
     );
 
-    // publishDiagnostics notifications
-    this.disposables.push(
-      connection.onNotification('textDocument/publishDiagnostics', (params: any) => {
-        const uri: string | undefined = params?.uri;
-        if (!uri) return;
-        const state = this.getOrCreateState(uri);
-        state.diagnostics = params.diagnostics ?? [];
-
-        // LSP `publishDiagnostics` may include the document version. If
-        // present we trust it; otherwise we assume the diagnostics are
-        // for the latest version we have sent (best-effort fallback).
-        const incomingVersion: number = typeof params.version === 'number'
-          ? params.version
-          : state.latestSentVersion;
-        if (incomingVersion > state.diagnosticsVersion) {
-          state.diagnosticsVersion = incomingVersion;
-        }
-
-        log(TAG, `diagnostics[${shortUri(uri)}] (v${incomingVersion}): ${state.diagnostics.length} item(s)`,
-          state.diagnostics.map((d) => `[sev=${d.severity}] ${d.message.slice(0, 80)}`));
-
-        // Fire any qualifying waiters.
-        const stillWaiting: typeof state.diagnosticsResolvers = [];
-        for (const r of state.diagnosticsResolvers) {
-          if (state.diagnosticsVersion >= r.targetVersion) {
-            r.resolve();
-          } else {
-            stillWaiting.push(r);
-          }
-        }
-        state.diagnosticsResolvers = stillWaiting;
-      }),
-    );
+    // We deliberately do NOT subscribe to `textDocument/publishDiagnostics`.
+    // The push-style diagnostics stream is unreliable for our needs (it
+    // races with `fileProgress`, may be deduped by the server, etc.) and
+    // we get a strictly better, request/response equivalent by calling
+    // `Lean.Widget.getInteractiveDiagnostics` via `widgetRpcCall`.
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────
@@ -219,9 +169,9 @@ export class LeanSessionManager {
     // CRITICAL: mutate state synchronously BEFORE the first await, so
     // that concurrent calls with the same content short-circuit on the
     // identity check above. If we left `lastContent` unchanged until
-    // after the await, multiple parallel `runEvaluation`s with the same
-    // contribution would each see the old value, each decide to send a
-    // didChange, and the server would process N redundant edits.
+    // after the await, multiple parallel callers with the same content
+    // would each see the old value, each decide to send a didChange,
+    // and the server would process N redundant edits.
     const wasOpen = state.documentOpen;
     const version = ++state.latestSentVersion;
     state.lastContent = content;
@@ -230,38 +180,30 @@ export class LeanSessionManager {
     if (!wasOpen) {
       log(TAG, `didOpen[${shortUri(uri)}] (v${version}, ${content.length} chars)`);
       await this.connection.sendNotification('textDocument/didOpen', {
-        textDocument: {
-          uri,
-          languageId: 'lean4',
-          version,
-          text: content,
-        },
+        textDocument: { uri, languageId: 'lean4', version, text: content },
       });
     } else {
       log(TAG, `didChange[${shortUri(uri)}] (v${version}, ${content.length} chars)`);
       await this.connection.sendNotification('textDocument/didChange', {
-        textDocument: {
-          uri,
-          version,
-        },
+        textDocument: { uri, version },
         contentChanges: [{ text: content }],
       });
     }
   }
 
-  // ── Processing ──────────────────────────────────────────────────
+  // ── Progress observation ────────────────────────────────────────
 
   /**
    * Resolves once the server has finished elaborating the document
-   * version that was current at the time of the call. If processing has
-   * already caught up (e.g. the caller hit the `updateFile` dedup
+   * version that was current at the time of the call. If processing
+   * has already caught up (e.g. the caller hit the `updateFile` dedup
    * short-circuit and there is no edit in flight), resolves immediately.
    *
-   * The version-aware design fixes a regression that occurred when only
-   * the next `processing: []` notification was awaited: concurrent
-   * `evaluate()` calls would arrive after the latest processing cycle
-   * had already completed, then wait forever for a notification that
-   * was never going to come again.
+   * This must be awaited *between* `updateFile` and any widget RPC call
+   * whose result depends on the latest edit being elaborated. Lean's
+   * widget RPCs do NOT block on elaboration — they return data for the
+   * most recently elaborated snapshot, which during typing is the
+   * previous (often stale) version.
    */
   waitForProcessing(uri: string): Promise<void> {
     const state = this.getOrCreateState(uri);
@@ -271,35 +213,6 @@ export class LeanSessionManager {
     }
     return new Promise((resolve) => {
       state.processingResolvers.push({ targetVersion, resolve });
-    });
-  }
-
-  /**
-   * Resolves once the cached diagnostics correspond to a document
-   * version at or past the current `latestSentVersion`. If the cache
-   * is already that fresh (e.g. publishDiagnostics arrived during
-   * elaboration), resolves immediately. Otherwise waits for the next
-   * publishDiagnostics — but with a hard timeout, because Lean skips
-   * `publishDiagnostics` entirely when the new diagnostic set is
-   * byte-identical to the previous one. In that case the cache is
-   * already correct (the server is implicitly saying "no change") and
-   * resolving on timeout is the right thing to do.
-   */
-  waitForDiagnostics(uri: string): Promise<void> {
-    const state = this.getOrCreateState(uri);
-    const targetVersion = state.latestSentVersion;
-    if (state.diagnosticsVersion >= targetVersion) {
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => {
-      let resolved = false;
-      const wrapped = () => {
-        if (resolved) return;
-        resolved = true;
-        resolve();
-      };
-      state.diagnosticsResolvers.push({ targetVersion, resolve: wrapped });
-      setTimeout(wrapped, DIAGNOSTICS_WAIT_TIMEOUT_MS);
     });
   }
 
@@ -318,22 +231,22 @@ export class LeanSessionManager {
     };
   }
 
-  // ── Diagnostics ─────────────────────────────────────────────────
-
-  /** Latest published diagnostics for a URI. */
-  getDiagnostics(uri: string): LspDiagnostic[] {
-    return this.uriStates.get(uri)?.diagnostics ?? [];
-  }
-
   // ── Widget RPC ──────────────────────────────────────────────────
 
   /**
    * Make a Lean widget RPC call. Establishes the per-URI RPC session
    * (with keepalive) on first use. Retries once on "Outdated RPC session".
    *
-   * `position` defaults to (0,0) if omitted; some Lean RPC methods are
-   * position-sensitive (e.g. `getHypKinds` must be called at a position
-   * after the @[server_rpc_method] declaration in the file).
+   * Lean's widget RPC methods (notably `Lean.Widget.getInteractiveDiagnostics`)
+   * are request/response and hold the response until the relevant
+   * elaboration snapshot is ready. That property is what makes the rest
+   * of this class so simple — callers don't need to manually wait for
+   * processing or diagnostics; the RPC call itself blocks until the
+   * server has an answer.
+   *
+   * `position` defaults to (0,0); some Lean RPC methods are position-
+   * sensitive (e.g. `getHypKinds` must be called at a position after
+   * the @[server_rpc_method] declaration in the file).
    */
   async widgetRpcCall<T>(
     uri: string,
