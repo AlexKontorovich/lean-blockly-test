@@ -52,6 +52,24 @@ function text(t: string): CodeChunk {
 }
 
 /**
+ * If a tactic-body slot is empty, fill it with `skip` so the resulting
+ * Lean still parses and elaborates as a real proof attempt with an
+ * "unsolved goals" diagnostic. The diagnostic carries the goal state at
+ * that hole, which is exactly what we want to display to the player.
+ *
+ * `skip` is preferred over `sorry` because it doesn't make the
+ * declaration "succeed" with a warning — the proof legitimately fails
+ * with unsolved goals, and `LevelEvaluator` reports the level as
+ * incomplete (`complete: false`).
+ */
+function bodyOrSkip(bodyChunks: CodeChunk[], indent: string): CodeChunk[] {
+  if (bodyChunks.length === 0) {
+    return [text(`${indent}skip\n`)];
+  }
+  return bodyChunks;
+}
+
+/**
  * Generate code chunks from a single block and its children.
  */
 function blockToChunks(
@@ -79,7 +97,7 @@ function blockToChunks(
       // THEOREM_DECLARATION should contain the full signature, e.g. "(a b : ℕ) : a + b = b + a"
       chunks = [
         chunk(`theorem ${name} ${declaration} := by\n`, blockId),
-        ...proofChunks,
+        ...bodyOrSkip(proofChunks, indent + '  '),
       ];
       break;
     }
@@ -151,7 +169,7 @@ function blockToChunks(
       chunks = [
         ...indentChunk,
         chunk(`have ${name} : ${type} := by\n`, blockId),
-        ...proofChunks,
+        ...bodyOrSkip(proofChunks, indent + '  '),
       ];
       break;
     }
@@ -187,8 +205,13 @@ function blockToChunks(
       const body1Chunks = blockToChunks(inputs['BODY1']?.block, indent + '  ');
       const body2Chunks = blockToChunks(inputs['BODY2']?.block, indent + '  ');
 
-      // Replace first indent with bullet for each body
+      // Replace first indent with bullet for each body. If a branch is
+      // entirely empty, emit `· skip` so it parses and produces an
+      // unsolved-goals diagnostic at that branch.
       const bulletize = (bodyChunks: CodeChunk[]): CodeChunk[] => {
+        if (bodyChunks.length === 0) {
+          return [text(`${indent}· skip\n`)];
+        }
         if (bodyChunks.length > 0 && bodyChunks[0].text === indent + '  ') {
           return [text(`${indent}· `), ...bodyChunks.slice(1)];
         }
@@ -209,7 +232,9 @@ function blockToChunks(
       const proofChunks = blockToChunks(inputs['PROOF']?.block, indent + '  ');
 
       // Remove trailing newline from proof
-      const trimmedProofChunks = trimTrailingNewline(proofChunks);
+      const trimmedProofChunks = trimTrailingNewline(
+        bodyOrSkip(proofChunks, indent + '  '),
+      );
 
       chunks = [
         chunk(`show `, blockId),
