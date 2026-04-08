@@ -76,17 +76,60 @@ export interface EvaluationResult {
 // ── Internal helpers ────────────────────────────────────────────────
 
 /**
- * Flatten an InteractiveDiagnostic message TaggedText to a plain string,
- * for use as the diagnostic's display text. Embedded `goal` payloads
- * are omitted (they are surfaced separately via `leafGoals` and rendered
- * by the goal panel); embedded `expr` content is recursed into and
- * its text content concatenated.
+ * Generic plain-text flatten for any TaggedText. Walks text/append/tag
+ * uniformly, ignoring tag annotations entirely. Suitable for
+ * `CodeWithInfos` (TaggedText<SubexprInfo>), where the embed payload
+ * carries no display text and the tag content holds the rendering.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function flattenAnyTaggedText(tt: any): string {
+  if (!tt || typeof tt !== 'object') return '';
+  if ('text' in tt)   return tt.text;
+  if ('append' in tt) return tt.append.map(flattenAnyTaggedText).join('');
+  if ('tag' in tt)    return flattenAnyTaggedText(tt.tag[1]);
+  return '';
+}
+
+/** Render an InteractiveGoal as a compact plain-text block. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function renderGoalAsText(goal: any): string {
+  const lines: string[] = [];
+  if (goal.userName) lines.push(`case ${goal.userName}`);
+  for (const h of goal.hyps ?? []) {
+    const names = (h.names ?? []).join(' ');
+    const typeStr = flattenAnyTaggedText(h.type);
+    lines.push(`${names} : ${typeStr}`);
+  }
+  const goalPrefix = goal.goalPrefix ?? '⊢ ';
+  lines.push(`${goalPrefix}${flattenAnyTaggedText(goal.type)}`);
+  return lines.join('\n');
+}
+
+/**
+ * Flatten an InteractiveDiagnostic message TaggedText to a plain
+ * string. Unlike a naive recursive walk, this dispatches on the
+ * embed type when it hits a `tag` node — for `expr` and `goal`
+ * embeds, the actual display text lives in the *payload*, not in
+ * the tag's content (which is typically a placeholder like `{text:""}`).
  */
 function flattenInteractiveMessage(tt: TaggedText<MsgEmbed>): string {
   if ('text' in tt) return tt.text;
   if ('append' in tt) return tt.append.map(flattenInteractiveMessage).join('');
   if ('tag' in tt) {
-    const [, content] = tt.tag;
+    const [embed, content] = tt.tag;
+    if ('expr' in embed) {
+      return flattenAnyTaggedText(embed.expr);
+    }
+    if ('goal' in embed) {
+      return renderGoalAsText(embed.goal);
+    }
+    if ('widget' in embed) {
+      return flattenInteractiveMessage(embed.widget.alt);
+    }
+    if ('trace' in embed) {
+      return flattenInteractiveMessage(embed.trace.msg);
+    }
+    // lazyTrace or anything else: fall back to the tag content.
     return flattenInteractiveMessage(content);
   }
   return '';
