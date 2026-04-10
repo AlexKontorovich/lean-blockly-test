@@ -180,9 +180,9 @@ function blockToChunks(
       const arrow = direction === 'LEFT' ? '← ' : '';
       chunks = [
         ...indentChunk,
-        chunk(`rewrite [${arrow}`, blockId),
+        chunk(`rewrite ${arrow}`, blockId),
         ...sourceChunks,
-        chunk(`]\n`, blockId),
+        chunk(`\n`, blockId),
       ];
       break;
     }
