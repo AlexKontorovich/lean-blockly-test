@@ -243,8 +243,8 @@ function defineTactics() {
       'previousStatement': 'tactic',
       'nextStatement': 'tactic',
       'style': 'logic_blocks',
-      'tooltip': 'rw',
-      'helpUrl': 'rw',
+      'tooltip': 'rewrite',
+      'helpUrl': 'rewrite',
     },
     {
       'type': 'tactic_rw_at',
@@ -265,8 +265,8 @@ function defineTactics() {
       ],
       'inputsInline': false,
       'style': 'logic_blocks',
-      'tooltip': 'rw_at',
-      'helpUrl': 'rw_at',
+      'tooltip': 'rewrite_at',
+      'helpUrl': 'rewrite_at',
     },
     {
       'type': 'tactic_sorry',

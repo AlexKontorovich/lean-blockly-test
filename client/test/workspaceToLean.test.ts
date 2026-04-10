@@ -127,6 +127,69 @@ describe('workspaceToLean', () => {
       expect(lemmaInfo).toBeDefined();
       expect(lemmaInfo!.startLineCol).toEqual([0, 0]);
     });
+
+    test('rewrite tactic emits rewrite instead of rw', () => {
+      const ws = workspace(
+        lemma(
+          'rewrite_example',
+          '(x : ℝ) (h : x = 5) : x = 5',
+          {
+            type: 'tactic_rw',
+            id: 'rewrite-1',
+            fields: { DIRECTION_TYPE: 'RIGHT' },
+            inputs: {
+              REWRITE_SOURCE: {
+                block: {
+                  type: 'prop',
+                  id: 'prop-h',
+                  fields: { PROP_NAME: 'h' },
+                },
+              },
+            },
+          },
+        ),
+      );
+      const { leanCode } = workspaceToLean(ws);
+      expect(leanCode).toBe(
+        'theorem rewrite_example (x : ℝ) (h : x = 5) : x = 5 := by\n' +
+        '  rewrite [h]\n'
+      );
+      expect(leanCode).not.toContain('rw [h]');
+    });
+
+    test('rewrite at tactic emits bracketed rewrite syntax', () => {
+      const ws = workspace(
+        lemma(
+          'rewrite_at_example',
+          '(x y : ℝ) (h : x = y) (h2 : x = x) : x = x',
+          {
+            type: 'tactic_rw_at',
+            id: 'rewrite-at-1',
+            inputs: {
+              REWRITE_SOURCE: {
+                block: {
+                  type: 'prop',
+                  id: 'prop-h',
+                  fields: { PROP_NAME: 'h' },
+                },
+              },
+              REWRITE_TARGET: {
+                block: {
+                  type: 'prop',
+                  id: 'prop-h2',
+                  fields: { PROP_NAME: 'h2' },
+                },
+              },
+            },
+          },
+        ),
+      );
+      const { leanCode } = workspaceToLean(ws);
+      expect(leanCode).toBe(
+        'theorem rewrite_at_example (x y : ℝ) (h : x = y) (h2 : x = x) : x = x := by\n' +
+        '  rewrite [h] at h2\n'
+      );
+    });
   });
 
   // ── Ported from the previous client/test/test-workspaceToLean.ts ────
@@ -153,8 +216,8 @@ theorem fun_limit_fact FunLimAt (fun x => (x^2 - 1) / (x - 1)) 2 1 := by
     intro hy
     intro hy2
     simp
-    rw [away y hy]
-    rw [show y + 1 - 2 = y - 1 by
+    rewrite [away y hy]
+    rewrite [show y + 1 - 2 = y - 1 by
         grind]
     exact hy2
 `;

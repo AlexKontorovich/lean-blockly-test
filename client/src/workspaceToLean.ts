@@ -180,7 +180,7 @@ function blockToChunks(
       const arrow = direction === 'LEFT' ? '← ' : '';
       chunks = [
         ...indentChunk,
-        chunk(`rw [${arrow}`, blockId),
+        chunk(`rewrite [${arrow}`, blockId),
         ...sourceChunks,
         chunk(`]\n`, blockId),
       ];
@@ -192,9 +192,9 @@ function blockToChunks(
       const targetChunks = blockToChunks(inputs['REWRITE_TARGET']?.block, indent + '  ', true);
       chunks = [
         ...indentChunk,
-        chunk(`rw `, blockId),
+        chunk(`rewrite [`, blockId),
         ...sourceChunks,
-        chunk(` at `, blockId),
+        chunk(`] at `, blockId),
         ...targetChunks,
         chunk(`\n`, blockId),
       ];
